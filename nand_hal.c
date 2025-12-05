@@ -1,9 +1,11 @@
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
+#include <linux/kernel.h>
+#include <linux/module.h>
+#include <linux/vmalloc.h>  // malloc 대신 대용량 할당용
+#include <linux/string.h>   // memset, memcpy
+#include <linux/types.h>    // uint8_t, uint32_t 등
 #include "nand_hal.h"
 
-// 
+// 구조체 정의 (그대로 유지)
 typedef struct {
     uint8_t data[NAND_PAGE_SIZE];
     uint8_t oob[NAND_OOB_SIZE];
@@ -16,14 +18,21 @@ typedef struct {
     int is_bad;
 } nand_block_t;
 
+// 가상 디바이스 포인터
 static nand_block_t *nand_device = NULL;
 
 int nand_init(void) {
-    // alllcate space for nand
-    nand_device = (nand_block_t *)malloc(sizeof(nand_block_t) * BLOCKS_PER_CHIP);
-    if (!nand_device) return -1;
+    // 1. 메모리 할당 변경: malloc -> vmalloc
+    // NAND 전체 크기가 수백 MB 단위이므로 vmalloc 필수 (kmalloc은 용량 제한 있음)
+    unsigned long total_size = sizeof(nand_block_t) * BLOCKS_PER_CHIP;
+    
+    nand_device = (nand_block_t *)vmalloc(total_size);
+    if (!nand_device) {
+        printk(KERN_ERR "[NAND-HAL] Failed to vmalloc memory (%lu bytes)\n", total_size);
+        return -1;
+    }
 
-    // initialize
+    // 2. 초기화 (로직 동일)
     for (int i = 0; i < BLOCKS_PER_CHIP; i++) {
         nand_device[i].erase_count = 0;
         nand_device[i].is_bad = 0;
@@ -33,6 +42,8 @@ int nand_init(void) {
             nand_device[i].pages[j].is_written = 0;
         }
     }
+    
+    printk(KERN_INFO "[NAND-HAL] Initialized Virtual NAND (%lu MB)\n", total_size / (1024 * 1024));
     return NAND_SUCCESS;
 }
 
@@ -42,11 +53,14 @@ int nand_write(ppa_t ppa, const uint8_t *data_buf, const uint8_t *oob_buf) {
     int page = ppa % PAGES_PER_BLOCK;
 
     if (block >= BLOCKS_PER_CHIP) return NAND_ERR_INVALID;
+    // 커널 패닉 방지를 위해 NULL 체크 추가
+    if (!nand_device) return -1; 
     if (nand_device[block].is_bad) return NAND_ERR_BADBLOCK;
 
     // Overwrite Check
     if (nand_device[block].pages[page].is_written == 1) {
-        printf("[Error] Overwrite detected at Block %d, Page %d\n", block, page);
+        // printf -> printk(KERN_ERR ...) 변경
+        printk(KERN_ERR "[NAND-HAL] Overwrite detected at Block %d, Page %d\n", block, page);
         return NAND_ERR_OVERWRITE; 
     }
 
@@ -63,6 +77,7 @@ int nand_write(ppa_t ppa, const uint8_t *data_buf, const uint8_t *oob_buf) {
 
 int nand_erase(int block_index) {
     if (block_index >= BLOCKS_PER_CHIP) return NAND_ERR_INVALID;
+    if (!nand_device) return -1;
     if (nand_device[block_index].is_bad) return NAND_ERR_BADBLOCK;
 
     // erase
@@ -72,12 +87,12 @@ int nand_erase(int block_index) {
         nand_device[block_index].pages[j].is_written = 0;
     }
 
-    // errase count ++
+    // erase count ++
     nand_device[block_index].erase_count++;
 
-    // bad block
+    // bad block simulation
     if (nand_device[block_index].erase_count > 3000) {
-        printf("[HW Event] Block %d is worn out!\n", block_index); 
+        printk(KERN_NOTICE "[NAND-HAL] HW Event: Block %d is worn out!\n", block_index); 
     }
 
     return NAND_SUCCESS;
@@ -90,6 +105,7 @@ int nand_read(ppa_t ppa, uint8_t *data_buf, uint8_t *oob_buf) {
     int page = ppa % PAGES_PER_BLOCK;
 
     if (block >= BLOCKS_PER_CHIP) return NAND_ERR_INVALID;
+    if (!nand_device) return -1;
     if (nand_device[block].is_bad) return NAND_ERR_BADBLOCK;
 
     // read
@@ -106,19 +122,20 @@ int nand_read(ppa_t ppa, uint8_t *data_buf, uint8_t *oob_buf) {
 // free
 void nand_exit(void) {
     if (nand_device != NULL) {
-        free(nand_device);
+        vfree(nand_device); // free -> vfree 변경
         nand_device = NULL;
+        printk(KERN_INFO "[NAND-HAL] Memory Freed.\n");
     }
 }
 
 // Debug
 uint32_t nand_get_erase_count(int block_index) {
-    if (block_index >= BLOCKS_PER_CHIP) return 0;
+    if (block_index >= BLOCKS_PER_CHIP || !nand_device) return 0;
     return nand_device[block_index].erase_count;
 }
 
 // bad block
 int nand_is_bad_block(int block_index) {
-    if (block_index >= BLOCKS_PER_CHIP) return 1; 
+    if (block_index >= BLOCKS_PER_CHIP || !nand_device) return 1; 
     return nand_device[block_index].is_bad;
 }
